@@ -1,0 +1,6 @@
+.env
+data/
+*.zip
+*.log
+de_db.dump
+de_db.dump.gz
