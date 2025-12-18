@@ -6,8 +6,8 @@
 
 ## Быстрый старт (рекомендуется): восстановление из дампа
 1) Клонируй репо:
-   git clone <REPO_URL>
-   cd <repo>
+   git clone https://github.com/avgcring3/Project_ITDE
+   cd https://github.com/avgcring3/Project_ITDE
 
 2) Создай env:
    cp .env.example .env
