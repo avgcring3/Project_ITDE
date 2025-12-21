@@ -34,5 +34,6 @@ for f in files:
         method="multi",
         chunksize=5000,
     )
+    break
 
 print("done")
