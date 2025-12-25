@@ -164,33 +164,43 @@ CREATE TABLE IF NOT EXISTS dwh.product_performance_data_mart (
     )
 );
 CREATE TABLE IF NOT EXISTS dwh.order_performance_data_mart (
+  -- Размерность времени
   year                  int,
   month                 int,
   day                   int,
- city         text,
-  store_id              bigint,
-  store_address         text,
 
+  city                  text,
+  store_id              bigint,
+  store                 text,
   orders_total          int,
   orders_paid           int,
   orders_delivered      int,
   orders_canceled       int,
-
-  items_qty             bigint,
-  canceled_items_qty    bigint,
-
+  cancels_after_delivery int,
+  cancels_service_error  int,
+  turnover              numeric(18,2),
+  revenue               numeric(18,2),
+  profit                numeric(18,2),
   gross_items_amount    numeric(18,2),
   items_discount_amount numeric(18,2),
   order_discount_amount numeric(18,2),
   delivery_amount       numeric(18,2),
+  total_expenses        numeric(18,2),
 
-  net_amount            numeric(18,2),
+  items_qty             bigint,
+  canceled_items_qty    bigint,
+  unique_customers      int,
   avg_order_value       numeric(18,2),
-  cancellation_rate     numeric(6,4),
+  orders_per_customer   numeric(10,2),
+  revenue_per_customer  numeric(18,2),
 
+  courier_changes_count int,
+  active_couriers_count int,
+  cancellation_rate     numeric(6,4),
   load_date             date,
   created_at            timestamp without time zone NOT NULL DEFAULT now(),
-  updated_at            timestamp without time zone NOT NULL DEFAULT now()
+  updated_at            timestamp without time zone NOT NULL DEFAULT now(),
+  CONSTRAINT order_performance_data_mart_pkey PRIMARY KEY (year, month, day, store_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_order_mart_load_date
