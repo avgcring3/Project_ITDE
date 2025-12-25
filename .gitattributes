@@ -1,0 +1,6 @@
+# Force LF for shell scripts (fix /bin/env: 'bash\r')
+*.sh text eol=lf
+*.py text eol=lf
+*.sql text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
