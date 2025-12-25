@@ -1,57 +1,59 @@
 # de_project
 
 ## Требования
-- Docker Desktop + WSL2 (Windows) **или** Docker Engine (Linux/macOS)
-- `docker compose`
+- Docker Desktop (с включённым Docker Compose)
+- Git
 
 ---
 
 ## Быстрый старт (рекомендуется): восстановление из дампа
 
-### 1) Клонируй репо и подними контейнеры
+### 1)  Склонировать репозиторий
 ```bash
 git clone https://github.com/avgcring3/Project_ITDE.git
 cd Project_ITDE
 
-cp .env.example .env
-
-docker compose down -v || true
-docker compose up -d
 ```
-### 2) Скачай дамп и восстанови БД (Linux / WSL / macOS)
+### 2) Собрать и запустить проект
 ```bash
-curl -L -o de_db.dump.gz https://github.com/avgcring3/Project_ITDE/releases/download/v1.0.0/de_db.dump.gz
-gunzip -c de_db.dump.gz | docker exec -i de_postgres pg_restore -U de_user -d de_db --clean --if-exists
+docker compose up --build
 ```
-### 3) Открой pgAdmin
-http://localhost:5050
-
-Логин и пароль берутся из файла .env:
-
-PGADMIN_DEFAULT_EMAIL
-
-PGADMIN_DEFAULT_PASSWORD
-
-# Подключение к Postgres
-### Подключение с хоста (DBeaver / psql / IDE)
-```text
-host: localhost
-port: 5432
-db:   de_db
-user: de_user
-pass: de_password
-```
-### Подключение из pgAdmin (контейнер → контейнер)
-В pgAdmin: Register → Server
-```text
-Host name/address: de_postgres
-Port:              5432
-Maintenance DB:    de_db
-Username:          de_user
-Password:          de_password
-```
-## Проверка, что данные восстановились (опционально)
+### 3) Проверить, что контейнеры запущены
 ```bash
-docker exec -it de_postgres psql -U de_user -d de_db \
-  -c "select count(*) as orders_cnt from dwh.orders;"
-```  
+docker compose ps
+```
+### 4) Открыть интерфейсы
+Airflow → http://localhost:8080
+pgAdmin → http://localhost:5050
+
+pgAdmin логин:
+email: admin@admin.com
+password: admin
+
+airflow логин:
+email: airflow
+password: airflow
+
+### 5) Запустить витрины (обязательно)
+```bash
+docker compose exec airflow airflow dags test metrics_upd 2025-12-10
+```
+### 6) Проверить, что витрины создались
+```bash
+docker compose exec postgres psql -U de_user -d de_db -c "
+SELECT 'product' mart, COUNT(*) rows
+FROM dwh.product_performance_data_mart
+WHERE load_date = DATE '2025-12-10'
+UNION ALL
+SELECT 'order' mart, COUNT(*) rows
+FROM dwh.order_performance_data_mart
+WHERE load_date = DATE '2025-12-10';
+"
+```
+### 7) Если что то пошло не так*
+
+```bash
+docker compose down -v
+docker compose up --build
+```
+
