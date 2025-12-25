@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS dwh.drivers (
 
 CREATE TABLE IF NOT EXISTS dwh.stores (
   store_id BIGINT PRIMARY KEY,
-  store_adress TEXT
+  store TEXT
 );
 
 CREATE TABLE IF NOT EXISTS dwh.items (
