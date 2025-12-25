@@ -42,7 +42,7 @@ services:
 #    image: apache/airflow:2.9.3
     build:
       context: .
-      dockerfile: Dockerfile.airflow
+      dockerfile: Dockerfile
     image: project_itde_airflow:2.9.3-pyspark
     env_file: .env
     container_name: de_airflow

@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS dwh.order_performance_data_mart (
   year                  int,
   month                 int,
   day                   int,
-
+ city         text,
   store_id              bigint,
   store_address         text,
 
