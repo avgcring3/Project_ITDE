@@ -27,7 +27,7 @@ Airflow → http://localhost:8080
 pgAdmin → http://localhost:5050
 
 pgAdmin логин:
-email: admin@admin.com
+email: admin@example.com
 password: admin
 
 airflow логин:

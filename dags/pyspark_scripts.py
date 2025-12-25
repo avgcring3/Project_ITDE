@@ -7,6 +7,7 @@ from datetime import datetime
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, IntegerType, LongType
 from pyspark.sql.window import Window
 
 
@@ -292,10 +293,11 @@ def run_order_mode(process_date: str):
                 F.col("order_id").cast("long").alias("order_id"),
                 F.col("store_id").cast("long").alias("store_id"),
                 F.col("user_id").cast("long").alias("user_id"),
-                F.col("courier_id").cast("long").alias("courier_id"),
-                F.col("cancel_reason").alias("cancel_reason"),
+                F.col("driver_id").cast("long").alias("driver_id"),
+                F.col("order_cancellation_reason").alias("order_cancellation_reason"),
                 F.col("created_at").alias("created_at"),
                 F.col("paid_at").alias("paid_at"),
+                F.col("delivery_started_at").alias("delivery_started_at"),
                 F.col("delivered_at").alias("delivered_at"),
                 F.col("canceled_at").alias("canceled_at"),
                 F.coalesce(F.col("delivery_cost"), F.lit(0)).cast("decimal(18,2)").alias("delivery_cost"),
@@ -308,15 +310,30 @@ def run_order_mode(process_date: str):
             .withColumn("is_canceled", F.col("canceled_at").isNotNull())
             .withColumn(
                 "is_canceled_after_delivery",
-                F.when((F.col("canceled_at").isNotNull()) & (F.col("delivered_at").isNotNull()), 1).otherwise(0)
+                F.when(
+                    (F.col("canceled_at").isNotNull()) &
+                    (F.col("delivered_at").isNotNull()) &
+                    (F.col("canceled_at") > F.col("delivered_at")), 1
+                ).otherwise(0)
             )
             .withColumn(
                 "is_service_error_cancel",
                 F.when(
-                    (F.col("cancel_reason").isNotNull()) &
-                    (F.col("cancel_reason").isin(["Ошибка приложения", "Проблемы с оплатой"])),
+                    (F.col("order_cancellation_reason").isNotNull()) &
+                    (
+                            F.col("order_cancellation_reason").contains("Ошибка") |
+                            F.col("order_cancellation_reason").contains("Проблемы с оплатой") |
+                            F.col("order_cancellation_reason").contains("технические")
+                    ),
                     1
                 ).otherwise(0)
+            )
+            .withColumn(
+                "delivery_time_seconds",
+                F.when(
+                    F.col("delivery_started_at").isNotNull() & F.col("delivered_at").isNotNull(),
+                    F.unix_timestamp("delivered_at") - F.unix_timestamp("delivery_started_at")
+                ).otherwise(F.lit(None))
             )
         )
 
@@ -325,6 +342,7 @@ def run_order_mode(process_date: str):
             read_pg(spark, "dwh.order_items")
             .select(
                 F.col("order_id").cast("long").alias("order_id"),
+                F.col("item_id").cast("long").alias("item_id"),
                 F.coalesce(F.col("item_quantity"), F.lit(0)).cast("long").alias("item_quantity"),
                 F.coalesce(F.col("item_canceled_quantity"), F.lit(0)).cast("long").alias("item_canceled_quantity"),
                 F.coalesce(F.col("item_price"), F.lit(0)).cast("decimal(18,2)").alias("item_price"),
@@ -342,103 +360,96 @@ def run_order_mode(process_date: str):
             .withColumn(
                 "city",
                 F.when(
-                    F.col("store").isNotNull(),
-                    F.trim(F.split(F.col("store"), ",").getItem(1))
+                    F.col("store_address").isNotNull(),
+                    F.regexp_extract(F.col("store_address"), r",\s*([^,]+?)\s*,", 1)
                 ).otherwise(F.lit("Unknown"))
             )
         )
 
-        # Читаем расходы (если есть таблица с расходами)
-        # Предполагаем, что есть таблица dwh.expenses с store_id, order_id и amount
-        expenses = (
-            read_pg(spark, "dwh.expenses")
+        # Читаем информацию о товарах
+        items = (
+            read_pg(spark, "dwh.items")
             .select(
-                F.col("order_id").cast("long").alias("order_id"),
-                F.coalesce(F.col("amount"), F.lit(0)).cast("decimal(18,2)").alias("expense_amount")
+                F.col("item_id").cast("long").alias("item_id"),
+                F.col("item_category").alias("item_category")
             )
         )
 
-        # Читаем историю курьеров (для смен курьеров)
-        courier_history = (
-            read_pg(spark, "dwh.courier_assignments")
-            .filter(F.col("assignment_date") == p_date)
-            .select(
-                F.col("order_id").cast("long").alias("order_id"),
-                F.col("courier_id").cast("long").alias("courier_id")
-            )
-        )
-
-        # Агрегация по заказам
+        # Агрегация по заказам (товары)
         items_by_order = (
             oi.join(orders.select("order_id"), on="order_id", how="inner")
             .groupBy("order_id")
             .agg(
                 F.sum("item_quantity").cast("long").alias("qty"),
                 F.sum("item_canceled_quantity").cast("long").alias("canceled_qty"),
-                F.sum((F.col("item_price") * F.col("item_quantity")).cast("decimal(18,2)")).cast("decimal(18,2)").alias(
-                    "gross_amount"),
-                F.sum((F.col("item_discount") * F.col("item_quantity")).cast("decimal(18,2)")).cast(
-                    "decimal(18,2)").alias("item_discount_amount"),
+                F.sum(
+                    (F.col("item_price") * F.col("item_quantity")).cast("decimal(18,2)")
+                ).cast("decimal(18,2)").alias("gross_amount"),
+                F.sum(
+                    (F.col("item_discount") * F.col("item_quantity")).cast("decimal(18,2)")
+                ).cast("decimal(18,2)").alias("item_discount_amount"),
             )
         )
 
-        # Агрегация расходов по заказам
-        expenses_by_order = (
-            expenses.join(orders.select("order_id"), on="order_id", how="left")
-            .groupBy("order_id")
-            .agg(F.sum("expense_amount").cast("decimal(18,2)").alias("total_expense"))
+        # Агрегация по категориям товаров в заказах
+        items_by_order_category = (
+            oi.join(items, on="item_id", how="left")
+            .join(orders.select("order_id"), on="order_id", how="inner")
+            .groupBy("order_id", "item_category")
+            .agg(F.sum("item_quantity").cast("long").alias("category_qty"))
         )
 
-        # Агрегация уникальных курьеров и смен курьеров
-        if courier_history.count() > 0:
-            courier_changes = (
-                courier_history
-                .groupBy("order_id")
-                .agg(
-                    F.countDistinct("courier_id").cast("int").alias("courier_count"),
-                    F.count("courier_id").cast("int").alias("assignment_count")
-                )
-                .withColumn(
-                    "has_courier_change",
-                    F.when(F.col("courier_count") > 1, 1).otherwise(0)
-                )
+        # Наиболее популярная категория в заказе
+        most_popular_category = (
+            items_by_order_category
+            .withColumn(
+                "rn",
+                F.row_number().over(Window.partitionBy("order_id").orderBy(F.desc("category_qty")))
             )
-        else:
-            # Создаем пустой датафрейм если нет данных
-            from pyspark.sql.types import StructType, StructField, IntegerType, LongType
-            schema = StructType([
-                StructField("order_id", LongType(), True),
-                StructField("courier_count", IntegerType(), True),
-                StructField("assignment_count", IntegerType(), True),
-                StructField("has_courier_change", IntegerType(), True)
-            ])
-            courier_changes = spark.createDataFrame([], schema)
+            .filter(F.col("rn") == 1)
+            .select("order_id", F.col("item_category").alias("main_category"))
+        )
 
-        # Агрегация по пользователям
+        # Агрегация уникальных курьеров по магазину
+        couriers_by_store = (
+            orders.filter(F.col("driver_id").isNotNull())
+            .groupBy("store_id")
+            .agg(F.countDistinct("driver_id").cast("int").alias("active_couriers_count"))
+        )
+
+        # Агрегация по пользователям (уникальные клиенты)
         users_by_store = (
             orders.filter(F.col("is_paid"))
             .groupBy("store_id")
             .agg(F.countDistinct("user_id").cast("int").alias("unique_customers"))
         )
 
+        # Расчет времени доставки по заказам
+        delivery_stats = (
+            orders.filter(F.col("delivery_time_seconds").isNotNull())
+            .groupBy("store_id")
+            .agg(
+                F.avg("delivery_time_seconds").cast("decimal(10,2)").alias("avg_delivery_time_seconds"),
+                F.min("delivery_time_seconds").cast("long").alias("min_delivery_time_seconds"),
+                F.max("delivery_time_seconds").cast("long").alias("max_delivery_time_seconds")
+            )
+        )
+
         # Соединяем все данные
         joined = (
             orders
             .join(items_by_order, on="order_id", how="left")
-            .join(expenses_by_order, on="order_id", how="left")
-            .join(courier_changes, on="order_id", how="left")
+            .join(most_popular_category, on="order_id", how="left")
             .fillna({
                 "qty": 0,
                 "canceled_qty": 0,
                 "gross_amount": 0,
                 "item_discount_amount": 0,
-                "total_expense": 0,
-                "has_courier_change": 0
+                "main_category": "Unknown"
             })
             .withColumn("gross_amount", F.coalesce(F.col("gross_amount"), F.lit(0)).cast("decimal(18,2)"))
             .withColumn("item_discount_amount",
                         F.coalesce(F.col("item_discount_amount"), F.lit(0)).cast("decimal(18,2)"))
-            .withColumn("total_expense", F.coalesce(F.col("total_expense"), F.lit(0)).cast("decimal(18,2)"))
 
             # Рассчитываем дополнительные метрики на уровне заказа
             .withColumn(
@@ -447,19 +458,20 @@ def run_order_mode(process_date: str):
             )
             .withColumn(
                 "revenue",  # Выручка (сумма оплаты с учетом скидок)
-                (F.col("gross_amount") - F.col("item_discount_amount") - F.col("order_discount") + F.col(
-                    "delivery_cost")).cast("decimal(18,2)")
-            )
-            .withColumn(
-                "profit",  # Прибыль
-                (F.col("revenue") - F.col("total_expense")).cast("decimal(18,2)")
+                (
+                        F.col("gross_amount") -
+                        F.col("item_discount_amount") -
+                        F.col("order_discount") +
+                        F.col("delivery_cost")
+                ).cast("decimal(18,2)")
             )
         )
 
         # Группируем по дате, магазину и городу
         agg = (
-            joined.join(stores.select("store_id", "city"), on="store_id", how="left")
-            .groupBy("order_dt", "store_id", "city")
+            joined
+            .join(stores.select("store_id", "city", "store_address"), on="store_id", how="left")
+            .groupBy("order_dt", "store_id", "city", "store_address")
             .agg(
                 # Основные метрики количества
                 F.count(F.lit(1)).cast("int").alias("orders_total"),
@@ -474,48 +486,80 @@ def run_order_mode(process_date: str):
                 # Финансовые метрики
                 F.sum("turnover").cast("decimal(18,2)").alias("turnover"),
                 F.sum("revenue").cast("decimal(18,2)").alias("revenue"),
-                F.sum("profit").cast("decimal(18,2)").alias("profit"),
                 F.sum("gross_amount").cast("decimal(18,2)").alias("gross_items_amount"),
                 F.sum("item_discount_amount").cast("decimal(18,2)").alias("items_discount_amount"),
                 F.sum("order_discount").cast("decimal(18,2)").alias("order_discount_amount"),
                 F.sum("delivery_cost").cast("decimal(18,2)").alias("delivery_amount"),
-                F.sum("total_expense").cast("decimal(18,2)").alias("total_expenses"),
 
                 # Метрики товаров
                 F.sum("qty").cast("long").alias("items_qty"),
                 F.sum("canceled_qty").cast("long").alias("canceled_items_qty"),
 
-                # Метрики курьеров
-                F.sum(F.col("has_courier_change")).cast("int").alias("courier_changes_count"),
-                F.countDistinct("courier_id").cast("int").alias("active_couriers_count"),
+                # Самые популярные категории
+                F.first(F.col("main_category")).alias("most_popular_category"),
+
+                # Метрики времени доставки (агрегируем)
+                F.avg("delivery_time_seconds").cast("decimal(10,2)").alias("avg_delivery_time_seconds"),
             )
-            .join(stores.select("store_id", "store"), on="store_id", how="left")
             .join(users_by_store, on="store_id", how="left")
+            .join(couriers_by_store, on="store_id", how="left")
+            .join(delivery_stats, on="store_id", how="left")
             .fillna({
                 "unique_customers": 0,
-                "active_couriers_count": 0
+                "active_couriers_count": 0,
+                "avg_delivery_time_seconds": 0,
+                "min_delivery_time_seconds": 0,
+                "max_delivery_time_seconds": 0,
+                "most_popular_category": "Unknown"
             })
 
             # Рассчитываем производные метрики
             .withColumn(
                 "avg_order_value",
-                F.when(F.col("orders_total") > 0, (F.col("revenue") / F.col("orders_total")))
-                .otherwise(F.lit(0)).cast("decimal(18,2)")
+                F.when(
+                    F.col("orders_paid") > 0,
+                    (F.col("revenue") / F.col("orders_paid"))
+                ).otherwise(F.lit(0)).cast("decimal(18,2)")
             )
             .withColumn(
                 "orders_per_customer",
-                F.when(F.col("unique_customers") > 0, (F.col("orders_paid").cast("float") / F.col("unique_customers")))
-                .otherwise(F.lit(0)).cast("decimal(10,2)")
+                F.when(
+                    F.col("unique_customers") > 0,
+                    (F.col("orders_paid").cast("float") / F.col("unique_customers"))
+                ).otherwise(F.lit(0)).cast("decimal(10,2)")
             )
             .withColumn(
                 "revenue_per_customer",
-                F.when(F.col("unique_customers") > 0, (F.col("revenue") / F.col("unique_customers")))
-                .otherwise(F.lit(0)).cast("decimal(18,2)")
+                F.when(
+                    F.col("unique_customers") > 0,
+                    (F.col("revenue") / F.col("unique_customers"))
+                ).otherwise(F.lit(0)).cast("decimal(18,2)")
             )
             .withColumn(
                 "cancellation_rate",
-                F.when(F.col("orders_total") > 0, (F.col("orders_canceled").cast("double") / F.col("orders_total")))
-                .otherwise(F.lit(0)).cast("decimal(6,4)")
+                F.when(
+                    F.col("orders_total") > 0,
+                    (F.col("orders_canceled").cast("double") / F.col("orders_total"))
+                ).otherwise(F.lit(0)).cast("decimal(6,4)")
+            )
+            .withColumn(
+                "delivery_success_rate",
+                F.when(
+                    F.col("orders_total") > 0,
+                    (F.col("orders_delivered").cast("double") / F.col("orders_total"))
+                ).otherwise(F.lit(0)).cast("decimal(6,4)")
+            )
+            .withColumn(
+                "avg_delivery_time_minutes",
+                (F.col("avg_delivery_time_seconds") / 60).cast("decimal(10,2)")
+            )
+            .withColumn(
+                "min_delivery_time_minutes",
+                (F.col("min_delivery_time_seconds") / 60).cast("decimal(10,2)")
+            )
+            .withColumn(
+                "max_delivery_time_minutes",
+                (F.col("max_delivery_time_seconds") / 60).cast("decimal(10,2)")
             )
             .withColumn("year", F.year("order_dt").cast("int"))
             .withColumn("month", F.month("order_dt").cast("int"))
@@ -526,30 +570,37 @@ def run_order_mode(process_date: str):
             .select(
                 "year", "month", "day",
                 "city",
-                "store_id", "store",
+                "store_id", "store_address",
                 # Основные метрики
                 "orders_total", "orders_paid", "orders_delivered", "orders_canceled",
                 "cancels_after_delivery", "cancels_service_error",
                 # Финансовые метрики
-                "turnover", "revenue", "profit",
-                "gross_items_amount", "items_discount_amount", "order_discount_amount",
-                "delivery_amount", "total_expenses",
+                "turnover", "revenue", "gross_items_amount",
+                "items_discount_amount", "order_discount_amount", "delivery_amount",
                 # Метрики товаров
-                "items_qty", "canceled_items_qty",
+                "items_qty", "canceled_items_qty", "most_popular_category",
                 # Метрики клиентов
-                "unique_customers", "avg_order_value", "orders_per_customer", "revenue_per_customer",
+                "unique_customers", "avg_order_value",
+                "orders_per_customer", "revenue_per_customer",
                 # Метрики курьеров
-                "courier_changes_count", "active_couriers_count",
+                "active_couriers_count",
+                # Метрики времени доставки
+                "avg_delivery_time_minutes", "min_delivery_time_minutes",
+                "max_delivery_time_minutes",
                 # Процентные метрики
-                "cancellation_rate",
+                "cancellation_rate", "delivery_success_rate",
                 # Технические поля
                 "load_date", "created_at", "updated_at"
             )
         )
 
-        logger.info(f"Сохранение order mart в PostgreSQL за {process_date}...")
+        # Сохраняем результат
         write_pg_append(agg, "dwh.order_performance_data_mart")
         logger.info("Order mart успешно создана и сохранена.")
+
+    except Exception as e:
+        logger.error(f"Ошибка при создании order mart: {e}")
+        raise
     finally:
         spark.stop()
 
