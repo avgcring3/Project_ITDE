@@ -1,335 +1,454 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
-from pyspark.sql.window import Window
+# dags/pyspark_scripts.py
+from __future__ import annotations
+
+import os
 import sys
 import logging
 from datetime import datetime
-from pyspark.sql.functions import col,rank, trim, avg, current_timestamp, count, when, row_number, asc, desc, isnull, coalesce, lit, countDistinct, year, month, dayofmonth, dayofweek, weekofyear, split, to_date
 
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+
+# -------------------------
+# Common helpers
+# -------------------------
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     return logging.getLogger(__name__)
 
 
-def create_spark_session(app_name="E-commerce Data Mart"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
-        .config("spark.sql.sources.partitionOverwriteMode", "dynamic") \
-        .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2") \
+def _pg_url_props():
+    """
+    Единые настройки подключения к Postgres для обеих витрин.
+    Берем из env, иначе дефолты под твой docker-compose.
+    """
+    host = os.getenv("POSTGRES_HOST") or os.getenv("PGHOST") or "postgres"
+    port = os.getenv("POSTGRES_PORT") or os.getenv("PGPORT") or "5432"
+    db = os.getenv("POSTGRES_DB") or os.getenv("PGDATABASE") or "de_db"
+    user = os.getenv("POSTGRES_USER") or os.getenv("PGUSER") or "de_user"
+    pwd = os.getenv("POSTGRES_PASSWORD") or os.getenv("PGPASSWORD") or "de_password"
+
+    url = f"jdbc:postgresql://{host}:{port}/{db}"
+    props = {"user": user, "password": pwd, "driver": "org.postgresql.Driver"}
+    return url, props
+
+
+def create_spark_session(app_name: str) -> SparkSession:
+    # PostgreSQL JDBC driver (для read/write jdbc)
+    return (
+        SparkSession.builder
+        .appName(app_name)
+        .master("local[*]")
+        .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+        .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+        .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
+        .config("spark.jars.packages", "org.postgresql:postgresql:42.7.4")
         .getOrCreate()
+    )
 
 
-def read_data(spark):
+def _read_pg(spark: SparkSession, table: str):
+    url, props = _pg_url_props()
+    return spark.read.jdbc(url=url, table=table, properties=props)
+
+
+def _write_pg_append(df, table: str):
+    url, props = _pg_url_props()
+    (
+        df.write
+        .mode("append")
+        .format("jdbc")
+        .option("url", url)
+        .option("dbtable", table)
+        .option("user", props["user"])
+        .option("password", props["password"])
+        .option("driver", props["driver"])
+        .option("batchsize", 10000)
+        .save()
+    )
+
+
+# -------------------------
+# PRODUCT MART
+# -------------------------
+def read_data(spark: SparkSession):
     logger = logging.getLogger(__name__)
+    logger.info("Чтение таблиц из PostgreSQL...")
 
-    logger.info("Чтение таблиц...")
+    users_df = _read_pg(spark, "dwh.users")
+    drivers_df = _read_pg(spark, "dwh.drivers")
+    stores_df = _read_pg(spark, "dwh.stores")
+    items_df = _read_pg(spark, "dwh.items")
+    orders_df = _read_pg(spark, "dwh.orders")
+    order_items_df = _read_pg(spark, "dwh.order_items")
 
-    db_url = "jdbc:postgresql://postgres:5432/de_db"
-    properties = {"user": "de_user", "password": "de_password", "driver": "org.postgresql.Driver"}
-    orders_df = spark.read.jdbc(url=db_url, table="dwh.orders", properties=properties)
+    logger.info(f"orders: {orders_df.count()} rows")
+    logger.info(f"order_items: {order_items_df.count()} rows")
 
-    users_df = spark.read.jdbc(url=db_url, table="dwh.users", properties=properties)
-    drivers_df = spark.read.jdbc(url=db_url, table="dwh.drivers", properties=properties)
-    stores_df = spark.read.jdbc(url=db_url, table="dwh.stores", properties=properties)
-    items_df = spark.read.jdbc(url=db_url, table="dwh.items", properties=properties)
-    order_items_df = spark.read.jdbc(url=db_url, table="dwh.order_items", properties=properties)
-
-    logger.info(f"Заказы: {orders_df.count()} записей")
-    logger.info(f"Позиции заказов: {order_items_df.count()} записей")
-
-    return   users_df, drivers_df,  stores_df, items_df, orders_df,  order_items_df
+    return users_df, drivers_df, stores_df, items_df, orders_df, order_items_df
 
 
-def process_data(users_df, drivers_df, stores_df, items_df, orders_df, order_items_df, execution_date):
+def process_data(users_df, drivers_df, stores_df, items_df, orders_df, order_items_df, execution_date: str):
+    """
+    Формирует витрину dwh.product_performance_data_mart строго по DDL (без поля id).
+    execution_date приходит как YYYY-MM-DD.
+    """
     logger = logging.getLogger(__name__)
+    exec_date = F.to_date(F.lit(execution_date))
 
-    try:
+    logger.info(f"Обработка данных за дату: {execution_date}")
 
-        spark = orders_df.sparkSession
-
-        logger.info(f"Начало обработки данных для даты: {execution_date}")
-
-        execution_date_obj = to_date(lit(execution_date))
-
-        orders_prepared = orders_df \
-            .filter(to_date(col("created_at")) == execution_date_obj) \
-            .join(
-            stores_df.select("store_id", "store_address"),
-            "store_id",
-            "left"
-        ) \
-            .withColumn("year", year(col("created_at"))) \
-            .withColumn("month", month(col("created_at"))) \
-            .withColumn("day", dayofmonth(col("created_at"))) \
-            .withColumn("week", weekofyear(col("created_at"))) \
-            .withColumn("order_date", to_date(col("created_at"))) \
-            .withColumn(
+    orders_prepared = (
+        orders_df
+        .withColumn("order_date", F.to_date(F.col("created_at")))
+        .filter(F.col("order_date") == exec_date)
+        .join(stores_df.select("store_id", "store_address"), "store_id", "left")
+        .withColumn("year", F.year("created_at").cast("int"))
+        .withColumn("month", F.month("created_at").cast("int"))
+        .withColumn("day", F.dayofmonth("created_at").cast("int"))
+        .withColumn("week", F.weekofyear("created_at").cast("int"))
+        .withColumn(
             "city",
-            when(
-                col("store_address").isNotNull(),
-                trim(split(col("store_address"), ",").getItem(0))
-            ).otherwise(lit("Unknown"))
-        ) \
-            .select(
-            "order_id",
-            "store_id",
-            "store_address",
-            "city",
-            "year",
-            "month",
-            "day",
-            "week",
-            "order_date",
-            "created_at",
-            "delivered_at",
-            "canceled_at",
-            "user_id"
+            F.when(
+                F.col("store_address").isNotNull(),
+                F.trim(F.split(F.col("store_address"), ",").getItem(0)),
+            ).otherwise(F.lit("Unknown"))
         )
+        .select(
+            "order_id", "user_id", "store_id", "store_address",
+            "year", "month", "day", "week", "city", "order_date"
+        )
+    )
 
-        logger.info(f"orders_prepared count: {orders_prepared.count()}")
+    logger.info(f"orders_prepared: {orders_prepared.count()} rows")
 
-        order_items_filtered = order_items_df \
-            .join(orders_prepared.select("order_id", "user_id"), "order_id", "inner")
+    order_items_filtered = order_items_df.join(
+        orders_prepared.select("order_id", "user_id"),
+        on="order_id",
+        how="inner"
+    )
 
-        logger.info(f"order_items_filtered count: {order_items_filtered.count()}")
+    logger.info(f"order_items_filtered: {order_items_filtered.count()} rows")
 
-        if order_items_filtered.count() == 0:
-            logger.warning(f"Нет позиций заказов для даты {execution_date}")
-
-        enriched_data = order_items_filtered \
-            .join(
-            items_df.select("item_id", "item_title", "item_category"),
-            "item_id",
-            "left"
-        ) \
-            .join(
+    enriched = (
+        order_items_filtered
+        .join(items_df.select("item_id", "item_title", "item_category"), "item_id", "left")
+        .join(
             orders_prepared.select(
                 "order_id", "store_id", "store_address", "city",
-                "year", "month", "day", "week", "order_date",
-                "created_at", "delivered_at", "canceled_at"
+                "year", "month", "day", "week", "order_date"
             ),
             "order_id",
             "left"
         )
+    )
 
-        logger.info(f"enriched_data count: {enriched_data.count()}")
+    enriched = (
+        enriched
+        .withColumn("item_quantity", F.col("item_quantity").cast("int"))
+        .withColumn("item_canceled_quantity", F.coalesce(F.col("item_canceled_quantity").cast("int"), F.lit(0)))
+        .withColumn("item_price", F.col("item_price").cast("decimal(12,2)"))
+        .withColumn("item_discount", F.coalesce(F.col("item_discount").cast("decimal(12,2)"), F.lit(0.00)))
+    )
 
-        required_columns = ["order_id", "item_id", "store_id", "user_id", "item_quantity",
-                            "item_price", "item_discount", "item_canceled_quantity"]
-        for col_name in required_columns:
-            if col_name not in enriched_data.columns:
-                logger.error(f"Отсутствует обязательный столбец: {col_name}")
-                raise ValueError(f"Отсутствует обязательный столбец: {col_name}")
+    group_cols_day = [
+        "year", "month", "day", "week",
+        "city", "store_id", "store_address",
+        "item_category", "item_id", "item_title",
+    ]
 
-
-        enriched_data_fixed = enriched_data \
-            .withColumn("item_quantity", col("item_quantity").cast("int")) \
-            .withColumn("item_canceled_quantity",
-                        when(col("item_canceled_quantity").isNotNull(),
-                             col("item_canceled_quantity").cast("int"))
-                        .otherwise(lit(0))) \
-            .withColumn("item_price", col("item_price").cast("decimal(12,2)")) \
-            .withColumn("item_discount",
-                        when(col("item_discount").isNotNull(),
-                             col("item_discount").cast("decimal(12,2)"))
-                        .otherwise(lit(0)))
-        group_by_columns = [
-            "year",
-            "month",
-            "day",
-            "city",
-            "store_id",
-            "store_address",
-            "item_category",
-            "item_id",
-            "item_title"
-        ]
-
-        daily_metrics = enriched_data_fixed.groupBy(*group_by_columns).agg(
-
-            sum(
-                (col("item_quantity") - col("item_canceled_quantity")) *
-                (col("item_price") - col("item_discount"))
-            ).cast("decimal(12,2)").alias("item_revenue"),
-
-            sum("item_quantity").cast("long").alias("ordered_quantity"),
-
-            sum("item_canceled_quantity").cast("long").alias("canceled_quantity"),
-
-            countDistinct("order_id").cast("long").alias("orders_with_item"),
-
-            countDistinct(col("user_id")).cast("long").alias("unique_customers"),
-
-            sum(when(col("item_canceled_quantity") > 0, 1).otherwise(0))
-            .cast("long").alias("orders_with_cancellation"),
-
-            avg(col("item_quantity")).cast("decimal(10,2)").alias("avg_quantity_per_order")
-        ).withColumn(
-            "net_quantity",
-            (col("ordered_quantity") - col("canceled_quantity")).cast("long")
-        ).withColumn(
+    daily = (
+        enriched.groupBy(*group_cols_day).agg(
+            F.sum(
+                (F.col("item_quantity") - F.col("item_canceled_quantity")) *
+                (F.col("item_price") - F.col("item_discount"))
+            ).cast("decimal(15,2)").alias("item_revenue"),
+            F.sum("item_quantity").cast("int").alias("ordered_quantity"),
+            F.sum("item_canceled_quantity").cast("int").alias("canceled_quantity"),
+            F.countDistinct("order_id").cast("int").alias("orders_with_item"),
+            F.sum(F.when(F.col("item_canceled_quantity") > 0, 1).otherwise(0)).cast("int").alias("orders_with_cancellation"),
+        )
+        .withColumn("net_quantity", (F.col("ordered_quantity") - F.col("canceled_quantity")).cast("int"))
+        .withColumn(
             "cancellation_rate",
-            when(
-                col("ordered_quantity") > 0,
-                round(col("canceled_quantity") / col("ordered_quantity") * 100, 2)
-            ).otherwise(lit(0.0)).cast("decimal(5,2)")
-        ).withColumn(
-            "avg_order_value",
-            when(
-                col("orders_with_item") > 0,
-                round(col("item_revenue") / col("orders_with_item"), 2)
-            ).otherwise(lit(0.0)).cast("decimal(12,2)")
-        ).withColumn(
-            "sales_conversion_rate",
-            when(
-                col("ordered_quantity") > 0,
-                round((col("ordered_quantity") - col("canceled_quantity")) /
-                      col("ordered_quantity") * 100, 2)
-            ).otherwise(lit(0.0)).cast("decimal(5,2)")
+            F.when(
+                F.col("ordered_quantity") > 0,
+                F.round(F.col("canceled_quantity") / F.col("ordered_quantity") * 100, 2),
+            ).otherwise(F.lit(0.0)).cast("decimal(5,2)")
         )
-
-        logger.info(f"daily_metrics count: {daily_metrics.count()}")
-
-        if daily_metrics.count() == 0:
-            logger.warning(f"Нет данных для агрегации за {execution_date}")
-
-        window_daily = Window.partitionBy(
-            "year", "month", "day", "city", "store_id"
-        ).orderBy(col("item_revenue").desc())
-
-        daily_with_rank = daily_metrics.withColumn(
-            "daily_rank",
-            rank().over(window_daily).cast("int")
-        ).withColumn(
-            "revenue_share",
-            when(
-                sum(col("item_revenue")).over(
-                    Window.partitionBy("year", "month", "day", "city", "store_id")
-                ) > 0,
-                round(col("item_revenue") /
-                      sum(col("item_revenue")).over(
-                          Window.partitionBy("year", "month", "day", "city", "store_id")
-                      ) * 100, 2)
-            ).otherwise(lit(0.0)).cast("decimal(5,2)")
+        .withColumn(
+            "average_order_value",
+            F.when(
+                F.col("orders_with_item") > 0,
+                F.round(F.col("item_revenue") / F.col("orders_with_item"), 2),
+            ).otherwise(F.lit(0.0)).cast("decimal(10,2)")
         )
+    )
 
-        result_df = daily_with_rank \
-            .withColumn(
-            "most_popular_product_daily",
-            when(col("daily_rank") == 1, True).otherwise(False).cast("boolean")
-        ) \
-            .withColumn("load_date", execution_date_obj.cast("date")) \
-            .withColumn("created_at", current_timestamp()) \
-            .withColumn("data_date", execution_date_obj.cast("date")) \
-            .orderBy(
-            "year", "month", "day", "city", "store_id", "daily_rank"
-        )
+    w_day_desc = Window.partitionBy("year", "month", "day", "city", "store_id").orderBy(F.col("item_revenue").desc())
+    w_day_asc = Window.partitionBy("year", "month", "day", "city", "store_id").orderBy(F.col("item_revenue").asc())
 
-        result_df.cache()
-        result_count = result_df.count()
+    daily = (
+        daily
+        .withColumn("daily_rank", F.row_number().over(w_day_desc).cast("int"))
+        .withColumn("daily_rank_asc", F.row_number().over(w_day_asc).cast("int"))
+        .withColumn("most_popular_product_daily", (F.col("daily_rank") == 1).cast("boolean"))
+        .withColumn("least_popular_product_daily", (F.col("daily_rank_asc") == 1).cast("boolean"))
+        .drop("daily_rank_asc")
+    )
 
-        logger.info(f"Создана витрина: {result_count} записей")
-        logger.info(f"Уникальных магазинов: {result_df.select('store_id').distinct().count()}")
-        logger.info(f"Уникальных товаров: {result_df.select('item_id').distinct().count()}")
-        logger.info(f"Уникальных категорий: {result_df.select('item_category').distinct().count()}")
+    weekly_agg = (
+        daily.groupBy("year", "week", "city", "store_id", "item_id")
+        .agg(F.sum("item_revenue").cast("decimal(15,2)").alias("weekly_revenue"))
+    )
 
-        return result_df
+    w_week_desc = Window.partitionBy("year", "week", "city", "store_id").orderBy(F.col("weekly_revenue").desc())
+    w_week_asc = Window.partitionBy("year", "week", "city", "store_id").orderBy(F.col("weekly_revenue").asc())
 
-    except Exception as e:
-        logger.error(f"Ошибка в функции process_data: {str(e)}", exc_info=True)
-        raise
+    weekly_ranked = (
+        weekly_agg
+        .withColumn("weekly_rank", F.row_number().over(w_week_desc).cast("int"))
+        .withColumn("weekly_rank_asc", F.row_number().over(w_week_asc).cast("int"))
+        .withColumn("most_popular_product_weekly", (F.col("weekly_rank") == 1).cast("boolean"))
+        .withColumn("least_popular_product_weekly", (F.col("weekly_rank_asc") == 1).cast("boolean"))
+        .drop("weekly_rank_asc", "weekly_revenue")
+    )
+
+    monthly_agg = (
+        daily.groupBy("year", "month", "city", "store_id", "item_id")
+        .agg(F.sum("item_revenue").cast("decimal(15,2)").alias("monthly_revenue"))
+    )
+
+    w_month_desc = Window.partitionBy("year", "month", "city", "store_id").orderBy(F.col("monthly_revenue").desc())
+    w_month_asc = Window.partitionBy("year", "month", "city", "store_id").orderBy(F.col("monthly_revenue").asc())
+
+    monthly_ranked = (
+        monthly_agg
+        .withColumn("monthly_rank", F.row_number().over(w_month_desc).cast("int"))
+        .withColumn("monthly_rank_asc", F.row_number().over(w_month_asc).cast("int"))
+        .withColumn("most_popular_product_monthly", (F.col("monthly_rank") == 1).cast("boolean"))
+        .withColumn("least_popular_product_monthly", (F.col("monthly_rank_asc") == 1).cast("boolean"))
+        .drop("monthly_rank_asc", "monthly_revenue")
+    )
+
+    result = (
+        daily
+        .join(weekly_ranked, on=["year", "week", "city", "store_id", "item_id"], how="left")
+        .join(monthly_ranked, on=["year", "month", "city", "store_id", "item_id"], how="left")
+        .withColumn("load_date", exec_date.cast("date"))
+        .withColumn("created_at", F.current_timestamp())
+        .withColumn("updated_at", F.current_timestamp())
+    )
+
+    result = result.select(
+        F.col("year").cast("int"),
+        F.col("month").cast("int"),
+        F.col("day").cast("int"),
+        F.col("city"),
+        F.col("store_id").cast("int"),
+        F.col("store_address"),
+        F.col("item_category"),
+        F.col("item_id").cast("int"),
+        F.col("item_title"),
+
+        F.col("item_revenue").cast("decimal(15,2)"),
+        F.col("ordered_quantity").cast("int"),
+        F.col("canceled_quantity").cast("int"),
+        F.col("orders_with_item").cast("int"),
+        F.col("orders_with_cancellation").cast("int"),
+        F.col("net_quantity").cast("int"),
+
+        F.col("most_popular_product_daily").cast("boolean"),
+        F.col("least_popular_product_daily").cast("boolean"),
+
+        F.col("most_popular_product_weekly").cast("boolean"),
+        F.col("least_popular_product_weekly").cast("boolean"),
+
+        F.col("most_popular_product_monthly").cast("boolean"),
+        F.col("least_popular_product_monthly").cast("boolean"),
+
+        F.col("daily_rank").cast("int"),
+        F.col("weekly_rank").cast("int"),
+        F.col("monthly_rank").cast("int"),
+
+        F.col("cancellation_rate").cast("decimal(5,2)"),
+        F.col("average_order_value").cast("decimal(10,2)"),
+
+        F.col("load_date").cast("date"),
+        F.col("created_at"),
+        F.col("updated_at"),
+    )
+
+    logger.info(f"result rows: {result.count()}")
+    return result
 
 
-def calculate_popularity_metrics(df, period_col, period_name):
-    window_spec_popular = Window.partitionBy(period_col, "city", "store_id") \
-        .orderBy(desc(f"total_sold_{period_name}"), desc(f"orders_{period_name}"))
-
-    window_spec_unpopular = Window.partitionBy(period_col, "city", "store_id") \
-        .orderBy(asc(f"total_sold_{period_name}"), asc(f"orders_{period_name}"))
-
-    popular_items = df \
-        .withColumn("rank_popular", row_number().over(window_spec_popular)) \
-        .filter(col("rank_popular") == 1)
-
-    unpopular_items = df \
-        .withColumn("rank_unpopular", row_number().over(window_spec_unpopular)) \
-        .filter(col("rank_unpopular") == 1)
-
-    return popular_items, unpopular_items
-
-
-def save_to_postgres(data_mart_df, execution_date):
-    """Сохранение витрины данных в PostgreSQL"""
+def save_to_postgres(df, table_name: str):
     logger = logging.getLogger(__name__)
-
-    # Параметры подключения к PostgreSQL (замените на свои)
-    postgres_url = "jdbc:postgresql://postgres:5432/de_db"
-    properties = {
-        "user": "de_user",
-        "password": "de_password",
-        "driver": "org.postgresql.Driver"
-    }
-
-    try:
-        logger.info("Сохранение витрины данных в PostgreSQL...")
-
-        table_name = "dwh.products"
-        print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!', data_mart_df.show(5))
-        # Добавляем дату загрузки
-        # data_mart_df = data_mart_df.withColumn(
-        #     "load_date",
-        #     col("execution_date")
-        # ).withColumn(
-        #     "created_at",
-        #     datetime.now()
-        # )
-
-        # Сохраняем в PostgreSQL
-        data_mart_df.write \
-            .mode("append") \
-            .format("jdbc") \
-            .option("url", postgres_url) \
-            .option("dbtable", table_name) \
-            .option("user", properties["user"]) \
-            .option("password", properties["password"]) \
-            .option("driver", properties["driver"]) \
-            .option("batchsize", 10000) \
-            .option("truncate", "true")  # Очистка таблицы перед записью
-
-        logger.info(f"Данные сохранены в таблицу {table_name}")
-
-    except Exception as e:
-        logger.error(f"Ошибка при сохранении в PostgreSQL: {str(e)}")
-        raise
+    logger.info(f"Сохранение в PostgreSQL: {table_name} (append)")
+    _write_pg_append(df, table_name)
+    logger.info("Сохранение завершено")
 
 
+def build_product_mart(spark: SparkSession, execution_date: str):
+    users_df, drivers_df, stores_df, items_df, orders_df, order_items_df = read_data(spark)
+    dm = process_data(users_df, drivers_df, stores_df, items_df, orders_df, order_items_df, execution_date)
+    save_to_postgres(dm, "dwh.product_performance_data_mart")
+
+
+# -------------------------
+# ORDER MART
+# -------------------------
+def build_order_mart(spark: SparkSession, process_date: str):
+    p_date = F.to_date(F.lit(process_date))
+
+    orders = (
+        _read_pg(spark, "dwh.orders")
+        .select(
+            F.col("order_id").cast("long").alias("order_id"),
+            F.col("store_id").cast("long").alias("store_id"),
+            F.col("created_at").alias("created_at"),
+            F.col("paid_at").alias("paid_at"),
+            F.col("delivered_at").alias("delivered_at"),
+            F.col("canceled_at").alias("canceled_at"),
+            F.coalesce(F.col("delivery_cost"), F.lit(0)).cast("decimal(18,2)").alias("delivery_cost"),
+            F.coalesce(F.col("order_discount"), F.lit(0)).cast("decimal(18,2)").alias("order_discount"),
+        )
+        .withColumn("order_dt", F.to_date("created_at"))
+        .filter(F.col("order_dt") == p_date)
+        .withColumn("is_paid", F.col("paid_at").isNotNull())
+        .withColumn("is_delivered", F.col("delivered_at").isNotNull())
+        .withColumn("is_canceled", F.col("canceled_at").isNotNull())
+    )
+
+    oi = (
+        _read_pg(spark, "dwh.order_items")
+        .select(
+            F.col("order_id").cast("long").alias("order_id"),
+            F.coalesce(F.col("item_quantity"), F.lit(0)).cast("long").alias("item_quantity"),
+            F.coalesce(F.col("item_canceled_quantity"), F.lit(0)).cast("long").alias("item_canceled_quantity"),
+            F.coalesce(F.col("item_price"), F.lit(0)).cast("decimal(18,2)").alias("item_price"),
+            F.coalesce(F.col("item_discount"), F.lit(0)).cast("decimal(18,2)").alias("item_discount"),
+        )
+    )
+
+    stores = (
+        _read_pg(spark, "dwh.stores")
+        .select(
+            F.col("store_id").cast("long").alias("store_id"),
+            F.col("store_address").alias("store_address"),
+        )
+    )
+
+    items_by_order = (
+        oi.join(orders.select("order_id"), on="order_id", how="inner")
+        .groupBy("order_id")
+        .agg(
+            F.sum("item_quantity").alias("qty"),
+            F.sum("item_canceled_quantity").alias("canceled_qty"),
+            F.sum((F.col("item_price") * F.col("item_quantity")).cast("decimal(18,2)")).alias("gross_amount"),
+            F.sum((F.col("item_discount") * F.col("item_quantity")).cast("decimal(18,2)")).alias("item_discount_amount"),
+        )
+    )
+
+    joined = (
+        orders.join(items_by_order, on="order_id", how="left")
+        .fillna({"qty": 0, "canceled_qty": 0})
+        .withColumn("gross_amount", F.coalesce(F.col("gross_amount"), F.lit(0)).cast("decimal(18,2)"))
+        .withColumn("item_discount_amount", F.coalesce(F.col("item_discount_amount"), F.lit(0)).cast("decimal(18,2)"))
+    )
+
+    agg = (
+        joined.groupBy("order_dt", "store_id")
+        .agg(
+            F.count(F.lit(1)).cast("int").alias("orders_total"),
+            F.sum(F.when(F.col("is_paid"), 1).otherwise(0)).cast("int").alias("orders_paid"),
+            F.sum(F.when(F.col("is_delivered"), 1).otherwise(0)).cast("int").alias("orders_delivered"),
+            F.sum(F.when(F.col("is_canceled"), 1).otherwise(0)).cast("int").alias("orders_canceled"),
+
+            F.sum("qty").cast("long").alias("items_qty"),
+            F.sum("canceled_qty").cast("long").alias("canceled_items_qty"),
+
+            F.sum("gross_amount").cast("decimal(18,2)").alias("gross_items_amount"),
+            F.sum("item_discount_amount").cast("decimal(18,2)").alias("items_discount_amount"),
+            F.sum("order_discount").cast("decimal(18,2)").alias("order_discount_amount"),
+            F.sum("delivery_cost").cast("decimal(18,2)").alias("delivery_amount"),
+        )
+        .join(stores, on="store_id", how="left")
+        .withColumn(
+            "net_amount",
+            (F.col("gross_items_amount")
+             - F.col("items_discount_amount")
+             - F.col("order_discount_amount")
+             + F.col("delivery_amount")).cast("decimal(18,2)")
+        )
+        .withColumn(
+            "avg_order_value",
+            (F.col("net_amount") / F.when(F.col("orders_total") == 0, F.lit(None)).otherwise(F.col("orders_total")))
+            .cast("decimal(18,2)")
+        )
+        .withColumn(
+            "cancellation_rate",
+            (F.col("orders_canceled").cast("double") / F.when(F.col("orders_total") == 0, F.lit(None)).otherwise(F.col("orders_total")))
+            .cast("decimal(6,4)")
+        )
+        .withColumn("year", F.year("order_dt").cast("int"))
+        .withColumn("month", F.month("order_dt").cast("int"))
+        .withColumn("day", F.dayofmonth("order_dt").cast("int"))
+        .withColumn("load_date", F.lit(process_date).cast("date"))
+        .withColumn("created_at", F.current_timestamp())
+        .withColumn("updated_at", F.current_timestamp())
+        .select(
+            "year", "month", "day",
+            "store_id", "store_address",
+            "orders_total", "orders_paid", "orders_delivered", "orders_canceled",
+            "items_qty", "canceled_items_qty",
+            "gross_items_amount", "items_discount_amount", "order_discount_amount", "delivery_amount",
+            "net_amount", "avg_order_value", "cancellation_rate",
+            "load_date", "created_at", "updated_at"
+        )
+    )
+
+    save_to_postgres(agg, "dwh.order_performance_data_mart")
+
+
+# -------------------------
+# Entry point
+# -------------------------
 def main():
-    """Основная функция"""
     logger = setup_logging()
-    execution_date = sys.argv[1] if len(sys.argv) > 1 else datetime.now().strftime('%Y-%m-%d')
-    logger.info(f"Дата выполнения: {execution_date}")
+
+    # usage:
+    #   pyspark_scripts.py YYYY-MM-DD
+    #   pyspark_scripts.py YYYY-MM-DD order
+    if len(sys.argv) >= 2:
+        execution_date = sys.argv[1]
+    else:
+        execution_date = datetime.now().strftime("%Y-%m-%d")
+
+    mode = sys.argv[2].strip().lower() if len(sys.argv) >= 3 else "product"
+    if mode not in ("product", "order"):
+        raise SystemExit("Usage: pyspark_scripts.py YYYY-MM-DD [order]")
+
+    logger.info(f"Дата выполнения: {execution_date}, режим: {mode}")
+
+    app_name = "Order Performance Data Mart" if mode == "order" else "Product Performance Data Mart"
+    spark = create_spark_session(app_name)
 
     try:
+        if mode == "order":
+            build_order_mart(spark, execution_date)
+        else:
+            build_product_mart(spark, execution_date)
 
-        spark = create_spark_session()
-
-        users_df, drivers_df,  stores_df, items_df, orders_df,  order_items_df = read_data(spark)
-
-        data_mart_df = process_data(users_df, drivers_df,  stores_df, items_df, orders_df,  order_items_df, execution_date)
-
-        save_to_postgres(data_mart_df, execution_date)
-
-        logger.info("Витрина данных успешно создана и сохранена в PostgreSQL!")
-
+        logger.info("Витрина успешно создана и сохранена.")
+    finally:
         spark.stop()
-
-    except Exception as e:
-        logger.error(f"Ошибка при выполнении: {str(e)}")
-        raise
 
 
 if __name__ == "__main__":
