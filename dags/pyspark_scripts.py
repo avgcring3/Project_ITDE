@@ -94,7 +94,7 @@ def build_product_mart(users_df, drivers_df, stores_df, items_df, orders_df, ord
         orders_df
         .withColumn("order_date", F.to_date(F.col("created_at")))
         .filter(F.col("order_date") == exec_date)
-        .join(stores_df.select("store_id", "store_address"), "store_id", "left")
+        .join(stores_df.select("store_id", "store"), "store_id", "left")
         .withColumn("year", F.year("created_at").cast("int"))
         .withColumn("month", F.month("created_at").cast("int"))
         .withColumn("day", F.dayofmonth("created_at").cast("int"))
@@ -102,12 +102,12 @@ def build_product_mart(users_df, drivers_df, stores_df, items_df, orders_df, ord
         .withColumn(
             "city",
             F.when(
-                F.col("store_address").isNotNull(),
-                F.trim(F.split(F.col("store_address"), ",").getItem(1)),
+                F.col("store").isNotNull(),
+                F.trim(F.split(F.col("store"), ",").getItem(1)),
             ).otherwise(F.lit("Unknown"))
         )
         .select(
-            "order_id", "user_id", "store_id", "store_address",
+            "order_id", "user_id", "store_id", "store",
             "year", "month", "day", "week", "city", "order_date"
         )
     )
@@ -127,7 +127,7 @@ def build_product_mart(users_df, drivers_df, stores_df, items_df, orders_df, ord
         .join(items_df.select("item_id", "item_title", "item_category"), "item_id", "left")
         .join(
             orders_prepared.select(
-                "order_id", "store_id", "store_address", "city",
+                "order_id", "store_id", "store", "city",
                 "year", "month", "day", "week", "order_date"
             ),
             "order_id",
@@ -141,7 +141,7 @@ def build_product_mart(users_df, drivers_df, stores_df, items_df, orders_df, ord
 
     group_cols_day = [
         "year", "month", "day", "week",
-        "city", "store_id", "store_address",
+        "city", "store_id", "store",
         "item_category", "item_id", "item_title",
     ]
 
@@ -232,7 +232,7 @@ def build_product_mart(users_df, drivers_df, stores_df, items_df, orders_df, ord
             F.col("day").cast("int"),
             F.col("city"),
             F.col("store_id").cast("int"),
-            F.col("store_address"),
+            F.col("store"),
             F.col("item_category"),
             F.col("item_id").cast("int"),
             F.col("item_title"),
@@ -343,7 +343,7 @@ def run_order_mode(process_date: str):
             read_pg(spark, "dwh.stores")
             .select(
                 F.col("store_id").cast("long").alias("store_id"),
-                F.col("store_address").alias("store"),
+                F.col("store").alias("store"),
             )
             .withColumn(
                 "city",

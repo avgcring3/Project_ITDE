@@ -28,7 +28,7 @@ default_args = {
 dag = DAG(
     'check_metrics',
     default_args=default_args,
-    schedule_interval='@daily',
+    schedule_interval='0 7 * * *',
     catchup=False,
     max_active_runs=1,
     tags=['team_9']
