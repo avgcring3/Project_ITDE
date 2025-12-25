@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+
 from airflow import DAG
 from airflow.utils.dates import days_ago
 from airflow.operators.empty import EmptyOperator
@@ -17,15 +18,15 @@ default_args = {
     "email_on_retry": False,
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
-    "max_active_runs": 1,
 }
 
 with DAG(
     dag_id="metrics_upd",
     default_args=default_args,
-    description="Создание витрины dwh.product_performance_data_mart",
+    description="Создание витрин dwh.product_performance_data_mart и dwh.order_performance_data_mart",
     schedule_interval="0 2 * * *",
     catchup=False,
+    max_active_runs=1,
     tags=["team_9"],
 ) as dag:
 
@@ -52,26 +53,34 @@ with DAG(
         task_id="delete_for_day",
         postgres_conn_id="de_postgres",
         sql="""
-          DELETE FROM dwh.product_performance_data_mart
-	  DELETE FROM dwh.product_performance_data_mart WHERE load_date = '{{ ds }}';
-          DELETE FROM dwh.order_performance_data_mart   WHERE load_date = '{{ ds }}';
-          WHERE load_date = DATE '{{ ds }}';
+          DELETE FROM dwh.product_performance_data_mart WHERE load_date = DATE '{{ ds }}';
+          DELETE FROM dwh.order_performance_data_mart   WHERE load_date = DATE '{{ ds }}';
         """,
     )
-    create_order_mart = SparkSubmitOperator(
-    	task_id="create_order_mart",
-    	application="/opt/airflow/dags/pyspark_scripts.py",
-    	name="order-performance-datamart",
-    	application_args=["{{ ds }}", "order"],
-    	conn_id="spark_default",
-    	verbose=True,
-    )
 
-    create_data_mart = SparkSubmitOperator(
-        task_id="create_data_mart",
+    # PRODUCT mart (default mode)
+    create_product_mart = SparkSubmitOperator(
+        task_id="create_product_mart",
         application="/opt/airflow/dags/pyspark_scripts.py",
         application_args=["{{ ds }}"],
         name="product-performance-datamart",
+        conn_id="spark_default",
+        verbose=True,
+        conf={
+            "spark.master": "local[*]",
+            "spark.executor.memory": "2g",
+            "spark.driver.memory": "1g",
+        },
+        packages="org.postgresql:postgresql:42.7.4",
+    )
+
+    # ORDER mart (order mode)
+    create_order_mart = SparkSubmitOperator(
+        task_id="create_order_mart",
+        application="/opt/airflow/dags/pyspark_scripts.py",
+        application_args=["{{ ds }}", "order"],
+        name="order-performance-datamart",
+        conn_id="spark_default",
         verbose=True,
         conf={
             "spark.master": "local[*]",
@@ -83,4 +92,4 @@ with DAG(
 
     end = EmptyOperator(task_id="end")
 
-    start >> assert_sources_not_empty >> delete_for_day >> create_data_mart >> create_order_mart >> end
+    start >> assert_sources_not_empty >> delete_for_day >> create_product_mart >> create_order_mart >> end
