@@ -102,7 +102,7 @@ def build_product_mart(users_df, drivers_df, stores_df, items_df, orders_df, ord
             "city",
             F.when(
                 F.col("store_address").isNotNull(),
-                F.trim(F.split(F.col("store_address"), ",").getItem(0)),
+                F.trim(F.split(F.col("store_address"), ",").getItem(1)),
             ).otherwise(F.lit("Unknown"))
         )
         .select(
@@ -110,6 +110,7 @@ def build_product_mart(users_df, drivers_df, stores_df, items_df, orders_df, ord
             "year", "month", "day", "week", "city", "order_date"
         )
     )
+    print(orders_prepared.show(5))
 
     logger.info(f"orders_prepared: {orders_prepared.count()} rows")
 
@@ -284,6 +285,7 @@ def run_order_mode(process_date: str):
     try:
         p_date = F.to_date(F.lit(process_date))
 
+        # Читаем заказы за указанную дату
         orders = (
             read_pg(spark, "dwh.orders")
             .select(
@@ -303,6 +305,7 @@ def run_order_mode(process_date: str):
             .withColumn("is_canceled", F.col("canceled_at").isNotNull())
         )
 
+        # Читаем состав заказов
         oi = (
             read_pg(spark, "dwh.order_items")
             .select(
@@ -314,14 +317,23 @@ def run_order_mode(process_date: str):
             )
         )
 
+        # Читаем магазины и извлекаем город из адреса
         stores = (
             read_pg(spark, "dwh.stores")
             .select(
                 F.col("store_id").cast("long").alias("store_id"),
                 F.col("store_address").alias("store_address"),
             )
+            .withColumn(
+                "city",
+                F.when(
+                    F.col("store_address").isNotNull(),
+                    F.trim(F.split(F.col("store_address"), ",").getItem(1))
+                ).otherwise(F.lit("Unknown"))
+            )
         )
 
+        # Агрегация по заказам
         items_by_order = (
             oi.join(orders.select("order_id"), on="order_id", how="inner")
             .groupBy("order_id")
@@ -333,6 +345,7 @@ def run_order_mode(process_date: str):
             )
         )
 
+        # Соединяем заказы с агрегированными данными по товарам
         joined = (
             orders.join(items_by_order, on="order_id", how="left")
             .fillna({"qty": 0, "canceled_qty": 0})
@@ -340,8 +353,10 @@ def run_order_mode(process_date: str):
             .withColumn("item_discount_amount", F.coalesce(F.col("item_discount_amount"), F.lit(0)).cast("decimal(18,2)"))
         )
 
+        # Группируем по дате, магазину и городу
         agg = (
-            joined.groupBy("order_dt", "store_id")
+            joined.join(stores.select("store_id", "city"), on="store_id", how="left")
+            .groupBy("order_dt", "store_id", "city")
             .agg(
                 F.count(F.lit(1)).cast("int").alias("orders_total"),
                 F.sum(F.when(F.col("is_paid"), 1).otherwise(0)).cast("int").alias("orders_paid"),
@@ -354,7 +369,7 @@ def run_order_mode(process_date: str):
                 F.sum("order_discount").cast("decimal(18,2)").alias("order_discount_amount"),
                 F.sum("delivery_cost").cast("decimal(18,2)").alias("delivery_amount"),
             )
-            .join(stores, on="store_id", how="left")
+            .join(stores.select("store_id", "store_address"), on="store_id", how="left")
             .withColumn(
                 "net_amount",
                 (F.col("gross_items_amount") - F.col("items_discount_amount") - F.col("order_discount_amount") + F.col("delivery_amount")).cast("decimal(18,2)")
@@ -375,6 +390,7 @@ def run_order_mode(process_date: str):
             .withColumn("updated_at", F.current_timestamp())
             .select(
                 "year", "month", "day",
+                "city",  # Добавлено поле city
                 "store_id", "store_address",
                 "orders_total", "orders_paid", "orders_delivered", "orders_canceled",
                 "items_qty", "canceled_items_qty",
@@ -394,7 +410,7 @@ def run_order_mode(process_date: str):
 def main():
     logger = setup_logging()
 
-    process_date = sys.argv[1] if len(sys.argv) > 1 else datetime.now().strftime("%Y-%m-%d")
+    process_date = sys.argv[1] if len(sys.argv) > 1 else '2025-12-10'
     mode = sys.argv[2].strip().lower() if len(sys.argv) > 2 else "product"
 
     logger.info(f"Дата выполнения: {process_date}, режим: {mode}")

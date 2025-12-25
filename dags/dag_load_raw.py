@@ -128,6 +128,7 @@ def load_raw_data_from_parquet(**context):
         conn.execute(text("TRUNCATE TABLE dwh.raw_data;"))
 
     total_rows = 0
+    k=0
     for i, fp in enumerate(files, start=1):
         df = pd.read_parquet(fp)
         df.columns = [c.strip() for c in df.columns]
@@ -154,6 +155,9 @@ def load_raw_data_from_parquet(**context):
             method="multi",
             chunksize=5000,
         )
+        k+=1
+        if k==1:
+            break
 
     final_cnt = _get_raw_count(engine)
     print(f"Готово. dwh.raw_data строк: {final_cnt}")
