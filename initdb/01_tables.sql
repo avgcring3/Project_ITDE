@@ -163,3 +163,35 @@ CREATE TABLE IF NOT EXISTS dwh.product_performance_data_mart (
         load_date
     )
 );
+CREATE TABLE IF NOT EXISTS dwh.order_performance_data_mart (
+  year                  int,
+  month                 int,
+  day                   int,
+
+  store_id              bigint,
+  store_address         text,
+
+  orders_total          int,
+  orders_paid           int,
+  orders_delivered      int,
+  orders_canceled       int,
+
+  items_qty             bigint,
+  canceled_items_qty    bigint,
+
+  gross_items_amount    numeric(18,2),
+  items_discount_amount numeric(18,2),
+  order_discount_amount numeric(18,2),
+  delivery_amount       numeric(18,2),
+
+  net_amount            numeric(18,2),
+  avg_order_value       numeric(18,2),
+  cancellation_rate     numeric(6,4),
+
+  load_date             date,
+  created_at            timestamp without time zone NOT NULL DEFAULT now(),
+  updated_at            timestamp without time zone NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_mart_load_date
+  ON dwh.order_performance_data_mart(load_date);

@@ -1,382 +1,288 @@
-from datetime import datetime, timedelta
+# dags/dag_load_raw.py
+from __future__ import annotations
+
+from datetime import timedelta
 from airflow import DAG
+from airflow.utils.dates import days_ago
 from airflow.operators.python import PythonOperator
-from airflow.operators.dummy import DummyOperator
+from airflow.operators.empty import EmptyOperator
 from airflow.providers.postgres.operators.postgres import PostgresOperator
-import io
-import requests
-import pandas as pd
+
 import os
-import io
-import zipfile
 import glob
-import pandas as pd
-from sqlalchemy import create_engine
+import zipfile
 import requests
-from sqlalchemy import create_engine
-
-def load_raw_data(**context):
-
-    import os
-    # DATA_DIR = os.getenv("DATA_DIR", "/data")  # Будет /data из Docker
-    #
-    # DB = os.getenv("POSTGRES_DB", "de_db")
-    # USER = os.getenv("POSTGRES_USER", "de_user")
-    # PWD = os.getenv("POSTGRES_PASSWORD", "de_password")
-    # HOST = os.getenv("POSTGRES_HOST", "postgres")
-    # PORT = os.getenv("POSTGRES_PORT", "5432")
-    #
-    # engine = create_engine(f"postgresql+psycopg2://{USER}:{PWD}@{HOST}:{PORT}/{DB}")
-    #
-    # # Используем DATA_DIR для формирования пути
-    # parquet_pattern = os.path.join(DATA_DIR, "*.parquet")
-    # files = sorted(glob.glob(parquet_pattern))
-    # print(DATA_DIR)
-    #
-    # print(files)
-    # if not files:
-    #     raise SystemExit("Нет файлов *.parquet в папке data/")
-    #
-    # print("files:", len(files))
-    #
-    # for f in files:
-    #     df = pd.read_parquet(f)
-    #     df.columns = [c.strip() for c in df.columns]
-    #
-    #     if "item_replaced_id" in df.columns:
-    #         df["item_replaced_id"] = pd.to_numeric(df["item_replaced_id"], errors="coerce").astype("Int64")
-    #
-    #     print("loading", f, "rows", len(df))
-    #     df.to_sql(
-    #         "raw_data",
-    #         engine,
-    #         schema="dwh",
-    #         if_exists="append",
-    #         index=False,
-    #         method="multi",
-    #         chunksize=5000,
-    #     )
-    #     break
-    #
-    # print("done")
-    #
-    # # Возвращаем статистику
-    # total_rows = sum([len(pd.read_parquet(f)) for f in files])
-    # context['ti'].xcom_push(key='loaded_files', value=len(files))
-    # context['ti'].xcom_push(key='loaded_rows', value=total_rows)
-    #
-    # return f"Loaded {len(files)} files with {total_rows} total rows"
+import pandas as pd
+from sqlalchemy import create_engine, text
 
 
-    # Конфигурация базы данных (остается без изменений)
-
-    # Конфигурация базы данных
-    DB = os.getenv("POSTGRES_DB", "de_db")
-    USER = os.getenv("POSTGRES_USER", "de_user")
-    PWD = os.getenv("POSTGRES_PASSWORD", "de_password")
-    HOST = os.getenv("POSTGRES_HOST", "postgres")
-    PORT = os.getenv("POSTGRES_PORT", "5432")
-
-    engine = create_engine(f"postgresql+psycopg2://{USER}:{PWD}@{HOST}:{PORT}/{DB}")
-
-    # === 1. КОНФИГУРАЦИЯ ПУБЛИЧНОЙ ССЫЛКИ ===
-    PUBLIC_URL = os.getenv("YANDEX_PUBLIC_URL", "https://disk.yandex.ru/d/SrJBRwi_hPOYsw")
-
-    # Временные файлы для скачивания и распаковки
-    TEMP_ZIP = os.getenv("TEMP_ZIP_PATH", "/tmp/data.zip")
-    TEMP_DIR = os.getenv("TEMP_EXTRACT_DIR", "/data")
-
-    if os.path.isdir(TEMP_DIR) and any(os.scandir(TEMP_DIR)):
-        print("ДАННЫЕ УЖЕ ЗАГРУЖЕНЫ (data не пустая)")
-        return "Данные загружены"
-    if not os.path.isfile(TEMP_ZIP):
+def _make_engine():
+    db = os.getenv("POSTGRES_DB", "de_db")
+    user = os.getenv("POSTGRES_USER", "de_user")
+    pwd = os.getenv("POSTGRES_PASSWORD", "de_password")
+    host = os.getenv("POSTGRES_HOST", "postgres")
+    port = os.getenv("POSTGRES_PORT", "5432")
+    return create_engine(f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}")
 
 
+def _get_raw_count(engine) -> int:
+    with engine.connect() as conn:
+        return int(conn.execute(text("SELECT COUNT(*) FROM dwh.raw_data")).scalar() or 0)
 
-    # === 2. ПОЛУЧЕНИЕ ПРЯМОЙ ССЫЛКИ НА СКАЧИВАНИЕ ===
-        print(f"Получение ссылки для публичного ресурса: {PUBLIC_URL}")
 
-        api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
-
-        try:
-            r = requests.get(api_url, params={"public_key": PUBLIC_URL})
-            r.raise_for_status()
-            download_data = r.json()
-            download_url = download_data["href"]
-            print(f"Получена прямая ссылка для скачивания")
-        except requests.exceptions.RequestException as e:
-            raise SystemExit(f"Ошибка при получении ссылки на скачивание: {str(e)}")
-        except KeyError:
-            raise SystemExit("Не удалось получить ссылку на скачивание из ответа API")
-
-        # === 3. СКАЧИВАНИЕ ZIP-АРХИВА ===
-        print(f"Скачивание архива в: {TEMP_ZIP}")
-
-        try:
-            with requests.get(download_url, stream=True) as response:
-                response.raise_for_status()
-
-                # Проверяем, что это действительно zip-архив
-                content_type = response.headers.get('content-type', '')
-                if 'zip' not in content_type and 'application/x-zip' not in content_type:
-                    print(f"Внимание: Content-Type: {content_type}. Возможно, это не ZIP-архив.")
-
-                total_size = int(response.headers.get('content-length', 0))
-
-                with open(TEMP_ZIP, 'wb') as f:
-                    if total_size:
-                        print(f"Общий размер: {total_size / (1024 * 1024):.2f} MB")
-
-                    downloaded = 0
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-
-                            # Прогресс для больших файлов
-                            if total_size and downloaded % (10 * 1024 * 1024) < 1024 * 1024:
-                                percent = (downloaded / total_size) * 100
-                                print(
-                                    f"Прогресс: {percent:.1f}% ({downloaded / (1024 * 1024):.1f}/{total_size / (1024 * 1024):.1f} MB)")
-
-                    print(f"Скачано: {downloaded / (1024 * 1024):.2f} MB")
-
-        except requests.exceptions.RequestException as e:
-            raise SystemExit(f"Ошибка при скачивании архива: {str(e)}")
-
-    # === 4. РАСПАКОВКА АРХИВА ===
-    print(f"Распаковка в: {TEMP_DIR}")
-
+def _resolve_extract_dir() -> str:
+    # Хотим писать в /data (как у тебя в логах), но если нет прав — падаем в /tmp/data
+    desired = os.getenv("DATA_DIR", "/data")
     try:
-        os.makedirs(TEMP_DIR, exist_ok=True)
+        os.makedirs(desired, exist_ok=True)
+        test_path = os.path.join(desired, ".write_test")
+        with open(test_path, "w") as f:
+            f.write("ok")
+        os.remove(test_path)
+        return desired
+    except Exception:
+        fallback = "/tmp/data"
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
 
-        # Проверяем, что файл является валидным zip-архивом
-        if not zipfile.is_zipfile(TEMP_ZIP):
-            raise SystemExit(f"Файл {TEMP_ZIP} не является ZIP-архивом")
 
-        with zipfile.ZipFile(TEMP_ZIP, 'r') as zip_ref:
-            # Получаем список файлов в архиве
-            file_list = zip_ref.namelist()
-            print(f"Найдено файлов в архиве: {len(file_list)}")
+def _yandex_public_download_href(public_url: str) -> str:
+    api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
+    r = requests.get(api_url, params={"public_key": public_url}, timeout=60)
+    r.raise_for_status()
+    j = r.json()
+    if "href" not in j:
+        raise SystemExit("Не удалось получить href из ответа Yandex Disk API")
+    return j["href"]
 
-            # Фильтруем только parquet файлы
-            parquet_files = [f for f in file_list if f.endswith('.parquet')]
-            print(f"Parquet файлов в архиве: {len(parquet_files)}")
 
-            if not parquet_files:
-                raise SystemExit("Нет файлов *.parquet в архиве")
+def _download_file(url: str, dst_path: str) -> None:
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    with requests.get(url, stream=True, timeout=600) as resp:
+        resp.raise_for_status()
+        with open(dst_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
 
-            # Распаковываем только parquet файлы
-            for parquet_file in parquet_files:
-                print(f"Распаковка: {parquet_file}")
-                zip_ref.extract(parquet_file, TEMP_DIR)
 
-    except zipfile.BadZipFile:
-        raise SystemExit(f"Ошибка: файл {TEMP_ZIP} поврежден или не является ZIP-архивом")
-    except Exception as e:
-        raise SystemExit(f"Ошибка при распаковке архива: {str(e)}")
+def _extract_only_parquet(zip_path: str, extract_dir: str) -> None:
+    if not zipfile.is_zipfile(zip_path):
+        raise SystemExit(f"Файл {zip_path} не является zip-архивом")
 
-    # === 5. ОБРАБОТКА PARQUET ФАЙЛОВ ===
-    print("Поиск распакованных parquet файлов...")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        names = z.namelist()
+        parquet_files = [n for n in names if n.endswith(".parquet")]
+        if not parquet_files:
+            raise SystemExit("В архиве не найдено parquet-файлов")
 
-    # Ищем все parquet файлы в распакованной директории
-    parquet_pattern = os.path.join(TEMP_DIR, "**", "*.parquet")
-    files = sorted(glob.glob(parquet_pattern, recursive=True))
+        for pf in parquet_files:
+            z.extract(pf, extract_dir)
 
-    print(f"Найдено parquet файлов после распаковки: {len(files)}")
+
+def _find_parquet_files(extract_dir: str) -> list[str]:
+    pattern = os.path.join(extract_dir, "**", "*.parquet")
+    return sorted(glob.glob(pattern, recursive=True))
+
+
+def load_raw_data_from_parquet(**context):
+    """
+    1) Проверяем dwh.raw_data:
+       - если уже >0 строк, выходим (идемпотентно)
+       - если 0 строк, загружаем parquet'и в dwh.raw_data
+    2) Parquet берём из распакованной папки; если нет — скачиваем zip с Yandex Disk и распаковываем.
+    """
+    engine = _make_engine()
+    raw_cnt = _get_raw_count(engine)
+    if raw_cnt > 0:
+        print(f"dwh.raw_data уже заполнена: {raw_cnt} строк. Пропускаем загрузку.")
+        return {"loaded": False, "raw_count": raw_cnt}
+
+    public_url = os.getenv("YANDEX_PUBLIC_URL", "https://disk.yandex.ru/d/SrJBRwi_hPOYsw")
+    zip_path = os.getenv("TEMP_ZIP_PATH", "/tmp/data.zip")
+    extract_dir = _resolve_extract_dir()
+
+    # 1) parquet уже есть?
+    files = _find_parquet_files(extract_dir)
+    if not files:
+        # 2) скачиваем zip, если его нет
+        if not os.path.exists(zip_path):
+            print(f"Получение прямой ссылки для: {public_url}")
+            href = _yandex_public_download_href(public_url)
+            print(f"Скачивание архива в: {zip_path}")
+            _download_file(href, zip_path)
+        else:
+            print(f"Zip уже существует: {zip_path}")
+
+        print(f"Распаковка parquet в: {extract_dir}")
+        _extract_only_parquet(zip_path, extract_dir)
+        files = _find_parquet_files(extract_dir)
 
     if not files:
-        raise SystemExit("Нет файлов *.parquet после распаковки")
+        raise SystemExit("После распаковки parquet-файлы не найдены")
+
+    print(f"Найдено parquet файлов: {len(files)} (папка: {extract_dir})")
+
+    # На всякий: если где-то частично загрузилось, чистим raw_data перед полной перезагрузкой
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE TABLE dwh.raw_data;"))
 
     total_rows = 0
+    for i, fp in enumerate(files, start=1):
+        df = pd.read_parquet(fp)
+        df.columns = [c.strip() for c in df.columns]
 
-    # === 6. ЗАГРУЗКА В БАЗУ ДАННЫХ ===
-    for file_path in files:
-        try:
-            df = pd.read_parquet(file_path)
-            df.columns = [c.strip() for c in df.columns]
+        # типизация проблемных полей
+        if "item_replaced_id" in df.columns:
+            df["item_replaced_id"] = pd.to_numeric(df["item_replaced_id"], errors="coerce").astype("Int64")
 
-            if "item_replaced_id" in df.columns:
-                df["item_replaced_id"] = pd.to_numeric(
-                    df["item_replaced_id"],
-                    errors="coerce"
-                ).astype("Int64")
+        # иногда в parquet могут быть пробелы/странные типы — лучше привести
+        int_cols = ["order_id", "user_id", "driver_id", "store_id", "item_id", "item_quantity", "item_canceled_quantity"]
+        for c in int_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            print(f"Загрузка {os.path.basename(file_path)}, строк: {len(df)}")
+        total_rows += len(df)
+        print(f"[{i}/{len(files)}] загрузка {os.path.basename(fp)}: {len(df)} строк")
 
-            df.to_sql(
-                "raw_data",
-                engine,
-                schema="dwh",
-                if_exists="append",
-                index=False,
-                method="multi",
-                chunksize=5000,
-            )
+        df.to_sql(
+            "raw_data",
+            engine,
+            schema="dwh",
+            if_exists="append",
+            index=False,
+            method="multi",
+            chunksize=5000,
+        )
 
-            total_rows += len(df)
-            break
+    final_cnt = _get_raw_count(engine)
+    print(f"Готово. dwh.raw_data строк: {final_cnt}")
 
-        except Exception as e:
-            print(f"Ошибка при обработке файла {file_path}: {str(e)}")
-            continue
-
-    # === 7. ОЧИСТКА ВРЕМЕННЫХ ФАЙЛОВ (опционально) ===
-    cleanup = os.getenv("CLEANUP_TEMP_FILES", "true").lower() == "true"
-    if cleanup:
-        print("Очистка временных файлов...")
-        try:
-            os.remove(TEMP_ZIP)
-            import shutil
-            shutil.rmtree(TEMP_DIR)
-            print("Временные файлы удалены")
-        except Exception as e:
-            print(f"Не удалось удалить временные файлы: {str(e)}")
-
-    # === 8. ВОЗВРАТ РЕЗУЛЬТАТОВ ===
-    print("Загрузка завершена")
-
-    context['ti'].xcom_push(key='loaded_files', value=len(files))
-    context['ti'].xcom_push(key='loaded_rows', value=total_rows)
-
-    return f"Loaded {len(files)} files with {total_rows} total rows from Yandex Disk (public link)"
+    ti = context["ti"]
+    ti.xcom_push(key="loaded_files", value=len(files))
+    ti.xcom_push(key="loaded_rows", value=int(total_rows))
+    return {"loaded": True, "loaded_files": len(files), "loaded_rows": int(total_rows), "raw_count": final_cnt}
 
 
 default_args = {
-    'owner': 'kzinovyeva',
-    'depends_on_past': False,
-    'start_date': datetime(2025, 12, 18),
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=30),
-    'execution_timeout': timedelta(hours=10),
+    "owner": "team_9",
+    "depends_on_past": False,
+    "start_date": days_ago(1),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
 }
 
-dag = DAG(
-    'load_data',
+with DAG(
+    dag_id="load_data",
     default_args=default_args,
-    schedule_interval='@daily',
+    schedule_interval="@daily",
     catchup=False,
-    max_active_runs=1,
-    tags=['team_9']
-)
+    tags=["team_9"],
+    description="Загрузка сырья из parquet в dwh.raw_data и нормализация в DWH таблицы",
+) as dag:
 
-SCHEMA_NAME = 'dwh'
-POSTGRES_CONN_ID = 'de_postgres'
+    start = EmptyOperator(task_id="start")
 
-
-
-load_raw_data_task = PythonOperator(
-    task_id='load_raw_data_from_parquet',
-    python_callable=load_raw_data,
-    dag=dag,
-    provide_context=True
-)
-
-create_users = PostgresOperator(
-    task_id='create_users',
-    postgres_conn_id=POSTGRES_CONN_ID,
-    sql=f"""
-    INSERT INTO {SCHEMA_NAME}.users (user_id, user_phone)
-    SELECT DISTINCT user_id, user_phone
-    FROM {SCHEMA_NAME}.raw_data
-    WHERE user_id IS NOT NULL
-    ON CONFLICT (user_id) DO NOTHING;
-    """,
-    dag=dag
-)
-
-create_drivers = PostgresOperator(
-    task_id='create_drivers',
-    postgres_conn_id=POSTGRES_CONN_ID,
-    sql=f"""
-    INSERT INTO {SCHEMA_NAME}.drivers (driver_id, driver_phone)
-    SELECT DISTINCT driver_id, driver_phone
-    FROM {SCHEMA_NAME}.raw_data
-    WHERE driver_id IS NOT NULL
-    ON CONFLICT (driver_id) DO NOTHING;
-    """,
-    dag=dag
-)
-
-create_stores = PostgresOperator(
-    task_id='create_stores',
-    postgres_conn_id=POSTGRES_CONN_ID,
-    sql=f"""
-    INSERT INTO {SCHEMA_NAME}.stores (store_id, store_address)
-    SELECT DISTINCT store_id, store_address
-    FROM {SCHEMA_NAME}.raw_data
-    WHERE store_id IS NOT NULL
-    ON CONFLICT (store_id) DO NOTHING;
-    """,
-    dag=dag
-)
-
-create_items = PostgresOperator(
-    task_id='create_items',
-    postgres_conn_id=POSTGRES_CONN_ID,
-    sql=f"""
-    -- Основные товары
-    INSERT INTO {SCHEMA_NAME}.items (item_id, item_title, item_category)
-    SELECT DISTINCT item_id, item_title, item_category
-    FROM {SCHEMA_NAME}.raw_data
-    WHERE item_id IS NOT NULL
-    ON CONFLICT (item_id) DO NOTHING;
-
-    -- Замененные товары
-    INSERT INTO {SCHEMA_NAME}.items (item_id, item_title, item_category)
-    SELECT DISTINCT item_replaced_id, 'Unknown Replacement Item', 'Unknown'
-    FROM {SCHEMA_NAME}.raw_data
-    WHERE item_replaced_id IS NOT NULL
-    ON CONFLICT (item_id) DO NOTHING;
-    """,
-    dag=dag
-)
-
-create_orders = PostgresOperator(
-    task_id='create_orders',
-    postgres_conn_id=POSTGRES_CONN_ID,
-    sql=f"""
-    INSERT INTO {SCHEMA_NAME}.orders (
-        order_id, user_id, store_id, driver_id, address_text,
-        created_at, paid_at, delivery_started_at, delivered_at, canceled_at,
-        payment_type, delivery_cost, order_discount, order_cancellation_reason
+    load_raw = PythonOperator(
+        task_id="load_raw_data_from_parquet",
+        python_callable=load_raw_data_from_parquet,
     )
-    SELECT DISTINCT
-        order_id, user_id, store_id, driver_id, address_text,
-        created_at, paid_at, delivery_started_at, delivered_at, canceled_at,
-        payment_type, delivery_cost, order_discount, order_cancellation_reason
-    FROM {SCHEMA_NAME}.raw_data
-    WHERE order_id IS NOT NULL
-    ON CONFLICT (order_id) DO NOTHING;
-    """,
-    dag=dag
-)
 
-create_order_items = PostgresOperator(
-    task_id='create_order_items',
-    postgres_conn_id=POSTGRES_CONN_ID,
-    sql=f"""
-    INSERT INTO {SCHEMA_NAME}.order_items (
-        order_id, item_id, item_quantity, item_price,
-        item_discount, item_canceled_quantity, item_replaced_id
+    create_users = PostgresOperator(
+        task_id="create_users",
+        postgres_conn_id="de_postgres",
+        sql="""
+            INSERT INTO dwh.users(user_id, user_phone)
+            SELECT DISTINCT user_id, user_phone
+            FROM dwh.raw_data
+            WHERE user_id IS NOT NULL
+            ON CONFLICT (user_id) DO NOTHING;
+        """,
     )
-    SELECT DISTINCT
-        order_id, item_id, item_quantity, item_price,
-        item_discount, item_canceled_quantity, item_replaced_id
-    FROM {SCHEMA_NAME}.raw_data
-    WHERE order_id IS NOT NULL AND item_id IS NOT NULL
-    ON CONFLICT (order_id, item_id) DO NOTHING;
-    """,
-    dag=dag
-)
 
+    create_drivers = PostgresOperator(
+        task_id="create_drivers",
+        postgres_conn_id="de_postgres",
+        sql="""
+            INSERT INTO dwh.drivers(driver_id, driver_phone)
+            SELECT DISTINCT driver_id, driver_phone
+            FROM dwh.raw_data
+            WHERE driver_id IS NOT NULL
+            ON CONFLICT (driver_id) DO NOTHING;
+        """,
+    )
 
+    create_stores = PostgresOperator(
+        task_id="create_stores",
+        postgres_conn_id="de_postgres",
+        sql="""
+            INSERT INTO dwh.stores(store_id, store_address)
+            SELECT DISTINCT store_id, store_address
+            FROM dwh.raw_data
+            WHERE store_id IS NOT NULL
+            ON CONFLICT (store_id) DO NOTHING;
+        """,
+    )
 
-load_raw_data_task >> [create_users, create_drivers, create_stores, create_items]
+    create_items = PostgresOperator(
+        task_id="create_items",
+        postgres_conn_id="de_postgres",
+        sql="""
+            INSERT INTO dwh.items(item_id, item_title, item_category)
+            SELECT DISTINCT item_id, item_title, item_category
+            FROM dwh.raw_data
+            WHERE item_id IS NOT NULL
+            ON CONFLICT (item_id) DO NOTHING;
+        """,
+    )
 
-[create_users, create_drivers, create_stores, create_items] >> create_orders
+    create_orders = PostgresOperator(
+        task_id="create_orders",
+        postgres_conn_id="de_postgres",
+        sql="""
+            INSERT INTO dwh.orders(
+                order_id, user_id, store_id, driver_id, address_text,
+                created_at, paid_at, delivery_started_at, delivered_at, canceled_at,
+                payment_type, delivery_cost, order_discount, order_cancellation_reason
+            )
+            SELECT DISTINCT ON (order_id)
+                order_id, user_id, store_id, driver_id, address_text,
+                created_at, paid_at, delivery_started_at, delivered_at, canceled_at,
+                payment_type, delivery_cost, order_discount, order_cancellation_reason
+            FROM dwh.raw_data
+            WHERE order_id IS NOT NULL
+            ORDER BY order_id, created_at NULLS LAST
+            ON CONFLICT (order_id) DO NOTHING;
+        """,
+    )
 
-create_orders >> create_order_items
+    create_order_items = PostgresOperator(
+        task_id="create_order_items",
+        postgres_conn_id="de_postgres",
+        sql="""
+            INSERT INTO dwh.order_items(
+                order_id, item_id, item_quantity, item_price, item_discount,
+                item_canceled_quantity, item_replaced_id
+            )
+            SELECT
+                order_id,
+                item_id,
+                COALESCE(SUM(item_quantity), 0)::int AS item_quantity,
+                MAX(item_price) AS item_price,
+                MAX(item_discount) AS item_discount,
+                COALESCE(SUM(item_canceled_quantity), 0)::int AS item_canceled_quantity,
+                MAX(item_replaced_id) AS item_replaced_id
+            FROM dwh.raw_data
+            WHERE order_id IS NOT NULL AND item_id IS NOT NULL
+            GROUP BY order_id, item_id
+            ON CONFLICT (order_id, item_id) DO NOTHING;
+        """,
+    )
 
+    end = EmptyOperator(task_id="end")
+
+    start >> load_raw
+    load_raw >> [create_users, create_drivers, create_stores, create_items]
+    [create_users, create_drivers, create_stores] >> create_orders
+    create_items >> create_orders
+    create_orders >> create_order_items >> end
