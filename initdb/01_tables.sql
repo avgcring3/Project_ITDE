@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS dwh.raw_data (
   delivery_cost NUMERIC(12,2),
 
   store_id BIGINT,
-  store_adress TEXT
+  store_address TEXT
 );
 
 CREATE TABLE IF NOT EXISTS dwh.users (
