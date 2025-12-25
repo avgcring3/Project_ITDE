@@ -10,8 +10,8 @@ FROM dwh.raw_data
 WHERE driver_id IS NOT NULL
 ON CONFLICT (driver_id) DO NOTHING;
 
-INSERT INTO dwh.stores (store_id, store_address)
-SELECT DISTINCT store_id, store_address
+INSERT INTO dwh.stores (store_id, store)
+SELECT DISTINCT store_id, store
 FROM dwh.raw_data
 WHERE store_id IS NOT NULL
 ON CONFLICT (store_id) DO NOTHING;
