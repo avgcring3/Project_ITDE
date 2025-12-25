@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS dwh.raw_data (
   delivery_cost NUMERIC(12,2),
 
   store_id BIGINT,
-  store_address TEXT
+  store TEXT
 );
 
 CREATE TABLE IF NOT EXISTS dwh.users (
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS dwh.drivers (
 
 CREATE TABLE IF NOT EXISTS dwh.stores (
   store_id BIGINT PRIMARY KEY,
-  store_address TEXT
+  store TEXT
 );
 
 CREATE TABLE IF NOT EXISTS dwh.items (
@@ -96,17 +96,15 @@ CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON dwh.order_items(order_id)
 
 
 CREATE TABLE IF NOT EXISTS dwh.product_performance_data_mart (
-    -- Record identifier
-    id BIGSERIAL PRIMARY KEY,
 
-    -- Time dimensions (from your groupBy)
+    id BIGSERIAL PRIMARY KEY,
     year INTEGER NOT NULL,
     month INTEGER NOT NULL CHECK (month BETWEEN 1 AND 12),
     day INTEGER NOT NULL CHECK (day BETWEEN 1 AND 31),
 
     city VARCHAR(255),
     store_id INTEGER,
-    store_address VARCHAR(500),
+    store VARCHAR(500),
     item_category VARCHAR(255),
     item_id INTEGER,
     item_title VARCHAR(500) NOT NULL,
@@ -130,16 +128,12 @@ CREATE TABLE IF NOT EXISTS dwh.product_performance_data_mart (
     weekly_rank INTEGER,
     monthly_rank INTEGER,
 
-    -- Additional calculated metrics
     cancellation_rate DECIMAL(5,2),  -- canceled_quantity / ordered_quantity * 100
     average_order_value DECIMAL(10,2),  -- item_revenue / orders_with_item
 
-    -- Technical fields
     load_date DATE NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    -- Constraints
     CONSTRAINT positive_metrics CHECK (
         item_revenue >= 0 AND
         ordered_quantity >= 0 AND

@@ -179,7 +179,7 @@ default_args = {
 with DAG(
     dag_id="load_data",
     default_args=default_args,
-    schedule_interval="@daily",
+    schedule_interval="0 7 * * *",
     catchup=False,
     tags=["team_9"],
     description="Загрузка сырья из parquet в dwh.raw_data и нормализация в DWH таблицы",
@@ -220,8 +220,8 @@ with DAG(
         task_id="create_stores",
         postgres_conn_id="de_postgres",
         sql="""
-            INSERT INTO dwh.stores(store_id, store_address)
-            SELECT DISTINCT store_id, store_address
+            INSERT INTO dwh.stores(store_id, store)
+            SELECT DISTINCT store_id, store
             FROM dwh.raw_data
             WHERE store_id IS NOT NULL
             ON CONFLICT (store_id) DO NOTHING;

@@ -24,7 +24,7 @@ with DAG(
     dag_id="metrics_upd",
     default_args=default_args,
     description="Создание витрин dwh.product_performance_data_mart и dwh.order_performance_data_mart",
-    schedule_interval="0 2 * * *",
+    schedule_interval="0 7 * * *",
     catchup=False,
     max_active_runs=1,
     tags=["team_9"],
