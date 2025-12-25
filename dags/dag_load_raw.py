@@ -220,8 +220,8 @@ with DAG(
         task_id="create_stores",
         postgres_conn_id="de_postgres",
         sql="""
-            INSERT INTO dwh.stores(store_id, store)
-            SELECT DISTINCT store_id, store
+            INSERT INTO dwh.stores(store_id, store_address)
+            SELECT DISTINCT store_id, store_address
             FROM dwh.raw_data
             WHERE store_id IS NOT NULL
             ON CONFLICT (store_id) DO NOTHING;
